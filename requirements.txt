@@ -1,2 +1,4 @@
 streamlit==1.47.0
 pandas==2.3.1
+beautifulsoup4 
+lxml
