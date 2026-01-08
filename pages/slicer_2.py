@@ -1,9 +1,16 @@
+# app.py
+# Streamlit: HWPX(2015/2022) 표 → JSON 변환기 (바로 실행 가능)
+#
+# 실행:
+#   pip install streamlit lxml
+#   streamlit run app.py
+
 import json
 import re
 import zipfile
 from dataclasses import dataclass
 from io import BytesIO
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 import streamlit as st
 from lxml import etree
@@ -440,14 +447,6 @@ def build_json_2015_from_setrows(setrows: List[Dict[str, Any]]) -> List[Dict[str
     return out
 
 def parse_hwpx_2015_to_result(hwpx_bytes: bytes) -> Dict[str, Any]:
-    """
-    2015: return structure for UI
-      {
-        "table_count": int,
-        "tables": [{"table_index": i, "items": [...]}, ...],
-        "items": [...]
-      }
-    """
     all_setrows: List[Dict[str, Any]] = []
     per_table: List[Dict[str, Any]] = []
 
@@ -479,10 +478,12 @@ def parse_hwpx_2015_to_result(hwpx_bytes: bytes) -> Dict[str, Any]:
 
 
 # ============================================================
-# 2022 parser (A~E) → JSON items
+# 2022 parser (A~E OR A~C 등 부분집합) → JSON items
 # ============================================================
 
+
 LEVELS_2022 = {"A": "a", "B": "b", "C": "c", "D": "d", "E": "e"}
+ORDER_2022 = ["a", "b", "c", "d", "e"]
 
 def detect_2022_header_row(grid: List[List[Optional[Cell]]], row_cnt: int) -> Optional[int]:
     for r in range(min(3, row_cnt)):
@@ -492,6 +493,15 @@ def detect_2022_header_row(grid: List[List[Optional[Cell]]], row_cnt: int) -> Op
     return None
 
 def parse_table_2022(tbl: etree._Element) -> List[Dict[str, Any]]:
+    """
+    2022 표 지원:
+    - 성취수준이 A~E가 아니라 A~C만 있는 표도 존재
+    - 레벨(A/B/...) 칸이 rowSpan으로 병합되어 아래 행은 빈 문자열인 경우가 있음 -> 직전 레벨로 처리
+    - 가장 중요한 수정: 레벨을 다 모으기 전에는 flush하지 않고,
+      '다음 성취기준 시작' 또는 '테이블 끝'에서만 flush한다.
+    - 출력 evaluation은 "실제로 등장한 최대 레벨"까지만 키 포함 (예: a~c)
+      (d/e가 없으면 키 자체를 출력하지 않음)
+    """
     grid, row_cnt, col_cnt = build_grid(tbl)
     if row_cnt <= 1 or col_cnt < 3:
         return []
@@ -500,58 +510,95 @@ def parse_table_2022(tbl: etree._Element) -> List[Dict[str, Any]]:
     if header_r is None:
         return []
 
-    # 보통 구조:
-    # col0: 성취기준(= id+문장)
+    # 일반적으로:
+    # col0: 성취기준([id] + 문장)
     # col1: A/B/C/D/E
     # col2: 설명 텍스트
     std_col, level_col, text_col = 0, 1, 2
 
     out: List[Dict[str, Any]] = []
-    current_std_raw = ""
-    eval_buf = {"a": "", "b": "", "c": "", "d": "", "e": ""}
 
-    def flush_if_complete():
-        nonlocal current_std_raw, eval_buf
-        if current_std_raw and all(eval_buf[k] for k in ["a", "b", "c", "d", "e"]):
-            id_, standard = split_id_and_standard(current_std_raw)
-            out.append({
-                "id": id_,
-                "standard": standard,
-                "evaluation": {
-                    "a": eval_buf["a"],
-                    "b": eval_buf["b"],
-                    "c": eval_buf["c"],
-                    "d": eval_buf["d"],
-                    "e": eval_buf["e"],
-                }
-            })
-            eval_buf = {"a": "", "b": "", "c": "", "d": "", "e": ""}
+    current_std_raw: str = ""
+    buf: Dict[str, List[str]] = {k: [] for k in ORDER_2022}
+    seen_levels: List[str] = []  # 등장 순서(최대 레벨 판단용)
+    last_level_key: Optional[str] = None
 
+    def finalize_current():
+        nonlocal current_std_raw, buf, seen_levels, last_level_key
+
+        if not current_std_raw:
+            return
+
+        # 어떤 레벨이든 최소 1개는 있어야 의미 있음
+        present = [k for k in ORDER_2022 if buf[k]]
+        if not present:
+            current_std_raw = ""
+            buf = {k: [] for k in ORDER_2022}
+            seen_levels = []
+            last_level_key = None
+            return
+
+        # 등장한 최대 레벨까지만 출력 키 포함 (예: a~c)
+        max_i = max(ORDER_2022.index(k) for k in present)
+        keys_to_emit = ORDER_2022[: max_i + 1]
+
+        id_, standard = split_id_and_standard(current_std_raw)
+
+        out.append({
+            "id": id_,
+            "standard": standard,
+            "evaluation": {k: join_sentences(buf[k]) for k in keys_to_emit}
+        })
+
+        # reset
+        current_std_raw = ""
+        buf = {k: [] for k in ORDER_2022}
+        seen_levels = []
+        last_level_key = None
+
+    # 본문 파싱
     for r in range(header_r + 1, row_cnt):
+        # 새 성취기준 시작 감지 (std_col에서 top-left일 때)
         std_cell = grid[r][std_col]
         if std_cell is not None and std_cell.r0 == r and std_cell.c0 == std_col:
+            # 이전 성취기준 마무리
+            finalize_current()
+
             current_std_raw = _norm(std_cell.text)
-            eval_buf = {"a": "", "b": "", "c": "", "d": "", "e": ""}
+            buf = {k: [] for k in ORDER_2022}
+            seen_levels = []
+            last_level_key = None
 
-        lvl_cell = grid[r][level_col]
-        lvl = _norm(lvl_cell.text) if lvl_cell is not None else ""
-        if lvl not in LEVELS_2022:
+        if not current_std_raw:
             continue
-        key = LEVELS_2022[lvl]
 
+        # 레벨 읽기
+        lvl_cell = grid[r][level_col]
+        lvl_txt = _norm(lvl_cell.text) if lvl_cell is not None else ""
+
+        # 레벨이 있으면 업데이트, 없으면 직전 레벨 사용(rowSpan 대응)
+        if lvl_txt in LEVELS_2022:
+            last_level_key = LEVELS_2022[lvl_txt]
+            seen_levels.append(last_level_key)
+
+        if last_level_key is None:
+            # 레벨도 없고 직전 레벨도 없으면 매핑 불가
+            continue
+
+        # 설명 텍스트 읽기
         txt_cell = grid[r][text_col]
         val = _norm(txt_cell.text) if txt_cell is not None else ""
-        eval_buf[key] = val
+        if not val:
+            continue
 
-        flush_if_complete()
+        buf[last_level_key].append(val)
+
+    # 테이블 끝에서 마지막 성취기준 마무리
+    finalize_current()
 
     return out
 
 def parse_hwpx_2022_to_result(hwpx_bytes: bytes) -> Dict[str, Any]:
-    """
-    2022: UI 호환을 위해 2015와 같은 result 구조로 감싼다.
-    - tables는 'table_index별 items'로 제공(가능하면)
-    """
     all_items: List[Dict[str, Any]] = []
     per_table: List[Dict[str, Any]] = []
 
@@ -594,7 +641,7 @@ hwpx_bytes = uploaded.read()
 
 edition = st.radio(
     "평가기준 버전",
-    ["2015 개정 (상/중/하)", "2022 개정 (A~E)"],
+    ["2015 개정 (상/중/하)", "2022 개정 (A~E 또는 A~C 등)"],
     horizontal=True
 )
 
@@ -640,12 +687,9 @@ st.divider()
 st.subheader("검증")
 
 if edition.startswith("2015"):
-    # 기존에 쓰던 간이검증(자식 id 패턴 등) — 필요 없으면 삭제 가능
     bad = [x for x in result["items"] if isinstance(x.get("id"), str) and len(x["id"].split("-")) >= 4]
     st.write(f"자식(평가준거) id로 보이는 항목 개수: **{len(bad)}** (0에 가까울수록 좋음)")
 else:
-    missing = [
-        x for x in result["items"]
-        if any(not x.get("evaluation", {}).get(k) for k in ["a", "b", "c", "d", "e"])
-    ]
-    st.write(f"A~E 중 누락된 항목 개수: **{len(missing)}** (0이어야 정상)")
+    # 2022는 A~E가 모두 안 나올 수 있으니, "evaluation이 비어있는 항목"만 체크
+    empty_eval = [x for x in result["items"] if not any(_norm(v) for v in x.get("evaluation", {}).values())]
+    st.write(f"evaluation이 전부 빈 항목 개수: **{len(empty_eval)}** (0이어야 정상)")
