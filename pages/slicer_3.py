@@ -29,23 +29,68 @@ def _normalize_text(s: str) -> str:
 def _clean_inline(s: str) -> str:
     """줄바꿈 제거 + 깨진 글자 대체 등 출력용 정리"""
     s = _normalize_text(s).replace("\n", " ").strip()
-    # HWPX에서 종종 깨져 나오는 기호들 대체
     s = s.replace("", "·")  # (서논술형) -> (서·논술형)
     s = re.sub(r"\s+", " ", s)
     return s
 
+# --- add: heading helpers (near configs) ---
+HEADING_MAX_LEN = 80  # 너무 긴 문단은 제목/소제목 후보에서 제외(오탐 방지)
+
+RESET_SECTION_PREFIXES = (
+    "가.", "가. 교육과정", "가. 교육과정 성취기준",
+    "참 고", "참고", "부록", "참 고 문 헌", "참고 문헌"
+)
+
+def _norm_for_match(s: str) -> str:
+    # 공백/개행 제거 + 흔한 점(.) 변형 통일(필요시 추가)
+    s = _clean_inline(s)
+    s = s.replace("．", ".")
+    return _normalize_header(s)
+
+def detect_title_type(para_text: str) -> Optional[Tuple[str, str]]:
+    """
+    return (type, original_title_text)
+    type: "ach" | "assess"
+    """
+    t_norm = _norm_for_match(para_text)
+
+    # 1) exact set match (공백/개행 차이 흡수)
+    for t in ACH_TITLES:
+
+        if _norm_for_match(t) == t_norm:
+            print(f"t: [{t}], norm_for: [{_norm_for_match(t)}], t_norm:[{t_norm}]")
+            print("matched!")
+            return ("ach", _clean_inline(para_text))
+    for t in ASSESS_TITLES:
+        if _norm_for_match(t) == t_norm:
+            return ("assess", _clean_inline(para_text))
+
+    # 2) heuristic fallback (세트에 없는 변형 제목도 잡기)
+    clean = _clean_inline(para_text)
+    if clean.startswith("나.") and ("성취" in clean and "수준" in clean):
+        return ("ach", clean)
+    if clean.startswith("다.") and ("평가" in clean and "도구" in clean):
+        return ("assess", clean)
+
+    return None
 
 # =========================
 # XML extraction helpers
 # =========================
 def extract_all_hp_text(elem: ET.Element, nsmap: Dict[str, str]) -> List[str]:
+    """
+    ✅ 핵심 수정:
+    hp:t 내부에 <hp:fwSpace/> 같은 자식이 끼면,
+    t.text에는 '◦'만 있고 실제 문장은 child.tail로 들어간다.
+    따라서 itertext()로 text+tail을 모두 수집해야 한다.
+    """
     hp_t = _ns("hp:t", nsmap)
-    out = []
+    out: List[str] = []
     for t in elem.iter(hp_t):
-        if t.text is not None:
-            txt = t.text.strip()
-            if txt:
-                out.append(txt)
+        txt = "".join(t.itertext())  # ✅ text + tail 모두 포함
+        txt = txt.strip()
+        if txt:
+            out.append(txt)
     return out
 
 def extract_cell_text(tc: ET.Element, nsmap: Dict[str, str]) -> str:
@@ -71,16 +116,25 @@ def split_eval_elements(text: str) -> List[str]:
         return []
     # bullet 분리
     if any(b in t for b in ["◦", "○", "•", "∙"]):
+        # bullet이 줄 중간에 붙어도 분리되도록, 각 줄 시작 기준 분리
         parts = re.split(r"(?:^|\n)\s*[◦○•∙]\s*", "\n" + t)
         return [_clean_inline(p) for p in parts if p.strip()]
     # fallback: 줄바꿈
     return [_clean_inline(p) for p in t.split("\n") if p.strip()]
 
 
-# =========================
+
+## =========================
 # Title / Header configs
 # =========================
-ACH_TITLES = {"나. 단원/영역별 성취수준", "나. 영역별 성취수준", "나. 단원별 성취수준 예시", "나. 영역별 성취수준"}
+ACH_TITLES = {
+    "나. 단원/영역별 성취수준", 
+    "나. 영역별 성취수준", 
+    "나. 단원별 성취수준 예시",
+    "나. 학기 단위 (과목 단위) 성취수준",
+    "나. 학기 단위 (과목 단위) 성취수준\n"
+
+}
 ASSESS_TITLES = {"다. 평가도구(예시)", "다. 예시 평가도구", "다. 평가도구(예시)"}
 
 SUBTITLE_RE = re.compile(r"^\(\d+\)\s*")  # subtitle 규칙: (숫자) 로 시작
@@ -97,9 +151,6 @@ ACH_DESC_HEADERS = {
     # 필요하면 여기도 변형 케이스 추가
     # _normalize_header("일반적특성"),
 }
-
-# ACH_HEADER_LEVEL = _normalize_header("성취수준")
-# ACH_HEADER_DESC = _normalize_header("일반적 특성")
 
 # assessment canonical names
 CAN_ITEM = _normalize_header("문항번호")
@@ -136,25 +187,34 @@ REQUIRED_ASSESS_CANON = {CAN_ITEM, CAN_UNIT, CAN_CODE, CAN_TYPE, CAN_ELEM}
 # =========================
 # Table parsers
 # =========================
+def _find_header_row_for_achievement(matrix: List[List[str]], scan_rows: int = 6) -> Optional[Tuple[int, int, int]]:
+    """
+    ✅ 캡션/설명 행이 표 맨 위에 들어가는 케이스 대응:
+    앞에서 몇 줄 스캔하면서 헤더(수준/일반적특성)를 찾는다.
+    """
+    for r_idx in range(min(scan_rows, len(matrix))):
+        header = [_normalize_header(x) for x in matrix[r_idx]]
+        print(f"=== {header} ===")
+        col_level = next((i for i, h in enumerate(header) if h in ACH_LEVEL_HEADERS), None)
+        col_desc  = next((i for i, h in enumerate(header) if h in ACH_DESC_HEADERS), None)
+        if col_level is not None and col_desc is not None:
+            return (r_idx, col_level, col_desc)
+    return None
+
 def parse_achievement_table(tbl: ET.Element, nsmap: Dict[str, str]) -> Optional[List[Dict[str, str]]]:
     matrix = table_to_matrix(tbl, nsmap)
     if not matrix or len(matrix) < 2:
         return None
 
-    header = [_normalize_header(x) for x in matrix[0]]
-    #if set(header) != {ACH_HEADER_LEVEL, ACH_HEADER_DESC}:
-     #   return None
-
-    # ✅ level/desc 컬럼을 aliases로 탐색
-    col_level = next((i for i, h in enumerate(header) if h in ACH_LEVEL_HEADERS), None)
-    col_desc  = next((i for i, h in enumerate(header) if h in ACH_DESC_HEADERS), None)
-
-    # 둘 다 못 찾으면 achievement table 아님
-    if col_level is None or col_desc is None:
+    found = _find_header_row_for_achievement(matrix)
+    if not found:
+        print("### header not found ###")
         return None
 
+    header_row_idx, col_level, col_desc = found
+
     items = []
-    for r in matrix[1:]:
+    for r in matrix[header_row_idx + 1:]:
         if len(r) <= max(col_level, col_desc):
             continue
         level = _clean_inline(r[col_level])
@@ -163,21 +223,36 @@ def parse_achievement_table(tbl: ET.Element, nsmap: Dict[str, str]) -> Optional[
         if not level and not desc:
             continue
         items.append({"level": level, "description": desc})
-
-    return items if len(items) >= 3 else None
+    print("#####")
+    print(items)
+    print("######")
+    return items if len(items) >= 1 else None
 
 def _canonize_header(h: str) -> str:
     nh = _normalize_header(h)
     return ASSESS_HEADER_ALIASES.get(nh, nh)
+
+def _find_header_row_for_assessment(matrix: List[List[str]], scan_rows: int = 6) -> Optional[int]:
+    """
+    (선택) 평가도구 표도 캡션행이 끼는 케이스가 있으니
+    REQUIRED_ASSESS_CANON이 만족되는 헤더 행을 스캔해서 찾는다.
+    """
+    for r_idx in range(min(scan_rows, len(matrix))):
+        header_canon = [_canonize_header(h) for h in matrix[r_idx]]
+        if REQUIRED_ASSESS_CANON.issubset(set(header_canon)):
+            return r_idx
+    return None
 
 def parse_assessment_table(tbl: ET.Element, nsmap: Dict[str, str]) -> Optional[List[Dict[str, Any]]]:
     matrix = table_to_matrix(tbl, nsmap)
     if not matrix or len(matrix) < 2:
         return None
 
-    header_canon = [_canonize_header(h) for h in matrix[0]]
-    if not REQUIRED_ASSESS_CANON.issubset(set(header_canon)):
+    header_row_idx = _find_header_row_for_assessment(matrix)
+    if header_row_idx is None:
         return None
+
+    header_canon = [_canonize_header(h) for h in matrix[header_row_idx]]
 
     def idx(can_name: str) -> int:
         return header_canon.index(can_name)
@@ -189,7 +264,7 @@ def parse_assessment_table(tbl: ET.Element, nsmap: Dict[str, str]) -> Optional[L
     col_elem = idx(CAN_ELEM)
 
     items = []
-    for r in matrix[1:]:
+    for r in matrix[header_row_idx + 1:]:
         if len(r) <= max(col_item, col_unit, col_code, col_type, col_elem):
             continue
 
@@ -241,7 +316,7 @@ def iter_outer_paragraphs(root: ET.Element, nsmap: Dict[str, str]):
 
 
 # =========================
-# Main parser: title 1개 아래 (subtitle→table)* 전부 누적
+# Main parser
 # =========================
 def parse_sections_from_section_xml(section_xml: str) -> List[Dict[str, Any]]:
     root = ET.fromstring(section_xml)
@@ -253,83 +328,110 @@ def parse_sections_from_section_xml(section_xml: str) -> List[Dict[str, Any]]:
     current_title: Optional[str] = None
     current_type: Optional[str] = None  # "ach" | "assess"
     pending_subtitle: Optional[str] = None
+    last_subtitle: Optional[str] = None
+
+    # ✅ subtitle을 잡은 뒤 “맞는 표”가 나올 때까지 기다리는 플래그
+    waiting_for_table: bool = False
 
     for p in iter_outer_paragraphs(root, nsmap):
         tbl = p.find(".//" + hp_tbl)
 
-        # (A) 표가 있는 문단이면: subtitle + table을 한 객체로 append
+        # (A) 표 문단
         if tbl is not None:
-            if not (current_title and current_type and pending_subtitle):
+            if not (current_title and current_type):
                 continue
 
+            # subtitle 없이 바로 표가 나오는 케이스도 있으니 fallback 유지
+            subtitle_for_table = pending_subtitle or last_subtitle or ""
+
+            # ✅ subtitle을 이미 잡았으면: “맞는 표가 나올 때까지” 스킵
             if current_type == "ach":
                 items = parse_achievement_table(tbl, nsmap)
                 if items:
                     results.append({
                         "title": current_title,
-                        "subtitle": pending_subtitle,
+                        "subtitle": subtitle_for_table,
                         "achievement_levels": items
                     })
                     pending_subtitle = None
+                    waiting_for_table = False
+                else:
+                    # ❗️여기가 핵심: tableA(교육과정/평가기준)면 그냥 무시하고 계속 기다림
+                    # subtitle은 유지한 채로 다음 표를 보게 한다.
+                    pass
+                continue
 
-            elif current_type == "assess":
+            if current_type == "assess":
                 items = parse_assessment_table(tbl, nsmap)
                 if items:
                     results.append({
                         "title": current_title,
-                        "subtitle": pending_subtitle,
+                        "subtitle": subtitle_for_table,
                         "assessment_items": items
                     })
                     pending_subtitle = None
+                    waiting_for_table = False
+                else:
+                    pass
+                continue
 
             continue
 
-        # (B) 일반 문단이면: title/subtitle 감지
+        # (B) 일반 문단: 문단 단위로 heading 판정
         texts = extract_all_hp_text(p, nsmap)
         if not texts:
             continue
 
-        for txt in texts:
-            txt = txt.strip()
+        para_text = _clean_inline(" ".join(texts))
+        if not para_text:
+            continue
 
-            if txt in ACH_TITLES:
-                current_title = "나. 단원/영역별 성취수준"
-                current_type = "ach"
+        # ✅ 큰 섹션 전환 감지 시 상태 리셋
+        if para_text.startswith(RESET_SECTION_PREFIXES):
+            current_title = None
+            current_type = None
+            pending_subtitle = None
+            waiting_for_table = False
+            continue
+
+        # 너무 긴 문단은 heading 후보 제외
+        if len(para_text) <= HEADING_MAX_LEN:
+            hit = detect_title_type(para_text)
+            if hit:
+                current_type, current_title = hit
                 pending_subtitle = None
+                waiting_for_table = False
                 continue
 
-            if txt in ASSESS_TITLES:
-                current_title = txt
-                current_type = "assess"
-                pending_subtitle = None
+            # subtitle
+            if SUBTITLE_RE.match(para_text):
+                pending_subtitle = para_text
+                last_subtitle = para_text
+                waiting_for_table = True
                 continue
 
-            if current_title and SUBTITLE_RE.match(txt):
-                pending_subtitle = txt
-                continue
+        # ✅ subtitle을 잡고 기다리는 중인데, 캡션/설명 문단이 끼는 건 정상.
+        # 아무 것도 하지 말고 계속 진행.
 
     return results
 
 
+
 # =========================
-# ✅ HWPX loader (section 순서 보장)
+# HWPX loader (section 순서 보장)
 # =========================
 _SECTION_RE = re.compile(r"^Contents/section(\d+)\.xml$")
 
 def _section_sort_key(name: str) -> Tuple[int, str]:
-    """
-    Contents/section2.xml 과 Contents/section10.xml을
-    문자열 정렬이 아니라 숫자(2,10)로 정렬하기 위한 key.
-    """
     m = _SECTION_RE.match(name)
     if not m:
-        return (10**9, name)  # 예외는 뒤로
+        return (10**9, name)
     return (int(m.group(1)), name)
 
 def read_hwpx_sections_from_bytes(hwpx_bytes: bytes) -> List[Tuple[str, str]]:
     with zipfile.ZipFile(io.BytesIO(hwpx_bytes), "r") as z:
         section_names = [n for n in z.namelist() if _SECTION_RE.match(n)]
-        section_names.sort(key=_section_sort_key)  # ✅ 숫자 기준 정렬
+        section_names.sort(key=_section_sort_key)
 
         out = []
         for name in section_names:
@@ -350,7 +452,6 @@ def parse_hwpx_bytes(hwpx_bytes: bytes) -> List[Dict[str, Any]]:
 st.set_page_config(page_title="HWPX 파서", layout="wide")
 st.title("HWPX > JSON (단원영역별 성취수준, 평가예시)")
 
-# ✅ hwpx만 받기
 uploaded = st.file_uploader(
     "파일 업로드 (.hwpx)",
     type=["hwpx"],
@@ -362,19 +463,18 @@ if st.button("파싱 실행", type="primary"):
         st.warning("파일을 먼저 업로드해줘.")
         st.stop()
 
-    results: List[Dict[str, Any]] = []
+    all_files_results: Dict[str, List[Dict[str, Any]]] = {}
+
     for f in uploaded:
         name = f.name
         data = f.read()
+        all_files_results[name] = parse_hwpx_bytes(data)
 
-        # ✅ hwpx만 처리
-        if not name.lower().endswith(".hwpx"):
-            st.warning(f"지원하지 않는 파일 형식: {name} (hwpx만 업로드 가능)")
-            continue
-
-        results.extend(parse_hwpx_bytes(data))
-
-    json_text = json.dumps(results, ensure_ascii=False, indent=2)
-
-    st.subheader("JSON 미리보기")
-    st.code(json_text, language="json")
+    # 화면 표시(다운로드 없이)
+    st.subheader("파일별 결과")
+    for fname, results in all_files_results.items():
+        ach_cnt = sum(1 for x in results if "achievement_levels" in x)
+        ass_cnt = sum(1 for x in results if "assessment_items" in x)
+        st.markdown(f"### {fname}")
+        st.caption(f"achievement: {ach_cnt}개, assessment: {ass_cnt}개, total: {len(results)}개")
+        st.code(json.dumps(results, ensure_ascii=False, indent=2), language="json")
