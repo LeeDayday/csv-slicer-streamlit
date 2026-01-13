@@ -80,13 +80,26 @@ def split_eval_elements(text: str) -> List[str]:
 # =========================
 # Title / Header configs
 # =========================
-ACH_TITLES = {"나. 단원/영역별 성취수준", "나. 영역별 성취수준"}
-ASSESS_TITLES = {"다. 평가도구(예시)", "다. 예시 평가도구"}
+ACH_TITLES = {"나. 단원/영역별 성취수준", "나. 영역별 성취수준", "나. 단원별 성취수준 예시", "나. 영역별 성취수준"}
+ASSESS_TITLES = {"다. 평가도구(예시)", "다. 예시 평가도구", "다. 평가도구(예시)"}
 
-SUBTITLE_RE = re.compile(r"^\(\d+\)\s*")  # ✅ subtitle 규칙: (숫자) 로 시작
+SUBTITLE_RE = re.compile(r"^\(\d+\)\s*")  # subtitle 규칙: (숫자) 로 시작
 
-ACH_HEADER_LEVEL = _normalize_header("성취수준")
-ACH_HEADER_DESC = _normalize_header("일반적 특성")
+# ✅ achievement table header aliases
+ACH_LEVEL_HEADERS = {
+    _normalize_header("성취수준"),
+    _normalize_header("수준"),
+}
+
+ACH_DESC_HEADERS = {
+    _normalize_header("일반적 특성"),
+    _normalize_header("일반적 특징")
+    # 필요하면 여기도 변형 케이스 추가
+    # _normalize_header("일반적특성"),
+}
+
+# ACH_HEADER_LEVEL = _normalize_header("성취수준")
+# ACH_HEADER_DESC = _normalize_header("일반적 특성")
 
 # assessment canonical names
 CAN_ITEM = _normalize_header("문항번호")
@@ -97,13 +110,16 @@ CAN_ELEM = _normalize_header("평가요소")
 
 ASSESS_HEADER_ALIASES = {
     _normalize_header("문항번호"): CAN_ITEM,
+    _normalize_header("문항 번호"): CAN_ITEM,
+
     _normalize_header("영역/단원명"): CAN_UNIT,
+    _normalize_header("영역"): CAN_UNIT,
 
     _normalize_header("교육과정성취기준코드"): CAN_CODE,
     _normalize_header("교육과정 성취기준 코드"): CAN_CODE,
     _normalize_header("평가준거성취기준코드"): CAN_CODE,
     _normalize_header("평가준거 성취기준 코드"): CAN_CODE,
-    _normalize_header("평가준거\n성취기준코드"): CAN_CODE,  # 줄바꿈이 헤더에 섞인 케이스도 normalize로 흡수됨
+    _normalize_header("평가준거\n성취기준코드"): CAN_CODE,
 
     _normalize_header("문항유형"): CAN_TYPE,
     _normalize_header("문항 유형"): CAN_TYPE,
@@ -126,19 +142,24 @@ def parse_achievement_table(tbl: ET.Element, nsmap: Dict[str, str]) -> Optional[
         return None
 
     header = [_normalize_header(x) for x in matrix[0]]
-    if set(header) != {ACH_HEADER_LEVEL, ACH_HEADER_DESC}:
-        return None
+    #if set(header) != {ACH_HEADER_LEVEL, ACH_HEADER_DESC}:
+     #   return None
 
-    col_level = header.index(ACH_HEADER_LEVEL)
-    col_desc = header.index(ACH_HEADER_DESC)
+    # ✅ level/desc 컬럼을 aliases로 탐색
+    col_level = next((i for i, h in enumerate(header) if h in ACH_LEVEL_HEADERS), None)
+    col_desc  = next((i for i, h in enumerate(header) if h in ACH_DESC_HEADERS), None)
+
+    # 둘 다 못 찾으면 achievement table 아님
+    if col_level is None or col_desc is None:
+        return None
 
     items = []
     for r in matrix[1:]:
         if len(r) <= max(col_level, col_desc):
             continue
         level = _clean_inline(r[col_level])
-        desc = _normalize_text(r[col_desc])  # 성취수준 설명은 줄바꿈 유지가 유리할 수도 있어 유지
-        desc = re.sub(r"\s+", " ", desc.replace("\n", " ")).strip()  # 결국 출력은 한 줄로
+        desc = _normalize_text(r[col_desc])
+        desc = re.sub(r"\s+", " ", desc.replace("\n", " ")).strip()
         if not level and not desc:
             continue
         items.append({"level": level, "description": desc})
@@ -175,7 +196,7 @@ def parse_assessment_table(tbl: ET.Element, nsmap: Dict[str, str]) -> Optional[L
         item_number = _clean_inline(r[col_item])
         domain_unit = _clean_inline(r[col_unit])
         curriculum_code = _clean_inline(r[col_code])
-        assessment_type = _clean_inline(r[col_type])  # ✅ 여기서 \n 제거 +  → ·
+        assessment_type = _clean_inline(r[col_type])
         eval_text = _normalize_text(r[col_elem])
 
         if not any([item_number, domain_unit, curriculum_code, assessment_type, eval_text]):
@@ -193,14 +214,13 @@ def parse_assessment_table(tbl: ET.Element, nsmap: Dict[str, str]) -> Optional[L
 
 
 # =========================
-# ✅ 핵심: "바깥 hp:p"만 순회 (표 안쪽 hp:p 제외)
+# "바깥 hp:p"만 순회 (표 안쪽 hp:p 제외)
 # =========================
 def iter_outer_paragraphs(root: ET.Element, nsmap: Dict[str, str]):
     hp_p = _ns("hp:p", nsmap)
     hp_tbl = _ns("hp:tbl", nsmap)
     hp_tc = _ns("hp:tc", nsmap)
 
-    # parent map 구성
     parent = {}
     for par in root.iter():
         for ch in list(par):
@@ -215,26 +235,15 @@ def iter_outer_paragraphs(root: ET.Element, nsmap: Dict[str, str]):
         return False
 
     for p in root.iter(hp_p):
-        # ✅ 표 내부(tc/tbl)의 hp:p는 제외
         if has_ancestor(p, {hp_tbl, hp_tc}):
             continue
         yield p
 
 
 # =========================
-# ✅ Main parser: title 1개 아래 (subtitle→table)* 전부 누적
+# Main parser: title 1개 아래 (subtitle→table)* 전부 누적
 # =========================
 def parse_sections_from_section_xml(section_xml: str) -> List[Dict[str, Any]]:
-    """
-    반환(평탄화):
-    [
-      {"title": "나. ...", "subtitle": "(1)...", "achievement_levels":[...]},
-      {"title": "나. ...", "subtitle": "(2)...", "achievement_levels":[...]},
-      ...
-      {"title": "다. ...", "subtitle": "(1)...", "assessment_items":[...]},
-      ...
-    ]
-    """
     root = ET.fromstring(section_xml)
     nsmap = {"hp": "http://www.hancom.co.kr/hwpml/2011/paragraph"}
     hp_tbl = _ns("hp:tbl", nsmap)
@@ -283,20 +292,18 @@ def parse_sections_from_section_xml(section_xml: str) -> List[Dict[str, Any]]:
         for txt in texts:
             txt = txt.strip()
 
-            # title start (여기서 ACH_TITLES처럼 set을 쓰면 in으로)
-            if txt in ACH_TITLES:  # 예: {"나. 단원/영역별 성취수준","나. 영역별 성취수준"}
-                current_title = "나. 단원/영역별 성취수준"  # 대표 title로 통일(원하면 txt로)
+            if txt in ACH_TITLES:
+                current_title = "나. 단원/영역별 성취수준"
                 current_type = "ach"
                 pending_subtitle = None
                 continue
 
-            if txt in ASSESS_TITLES:  # {"다. 평가도구(예시)","다. 예시 평가도구"}
-                current_title = txt  # 혹은 대표값으로 통일 가능
+            if txt in ASSESS_TITLES:
+                current_title = txt
                 current_type = "assess"
                 pending_subtitle = None
                 continue
 
-            # subtitle
             if current_title and SUBTITLE_RE.match(txt):
                 pending_subtitle = txt
                 continue
@@ -304,13 +311,26 @@ def parse_sections_from_section_xml(section_xml: str) -> List[Dict[str, Any]]:
     return results
 
 
+# =========================
+# ✅ HWPX loader (section 순서 보장)
+# =========================
+_SECTION_RE = re.compile(r"^Contents/section(\d+)\.xml$")
 
-# =========================
-# HWPX loader
-# =========================
+def _section_sort_key(name: str) -> Tuple[int, str]:
+    """
+    Contents/section2.xml 과 Contents/section10.xml을
+    문자열 정렬이 아니라 숫자(2,10)로 정렬하기 위한 key.
+    """
+    m = _SECTION_RE.match(name)
+    if not m:
+        return (10**9, name)  # 예외는 뒤로
+    return (int(m.group(1)), name)
+
 def read_hwpx_sections_from_bytes(hwpx_bytes: bytes) -> List[Tuple[str, str]]:
     with zipfile.ZipFile(io.BytesIO(hwpx_bytes), "r") as z:
-        section_names = sorted([n for n in z.namelist() if re.match(r"^Contents/section\d+\.xml$", n)])
+        section_names = [n for n in z.namelist() if _SECTION_RE.match(n)]
+        section_names.sort(key=_section_sort_key)  # ✅ 숫자 기준 정렬
+
         out = []
         for name in section_names:
             xml_text = z.read(name).decode("utf-8", errors="replace")
@@ -330,9 +350,10 @@ def parse_hwpx_bytes(hwpx_bytes: bytes) -> List[Dict[str, Any]]:
 st.set_page_config(page_title="HWPX 파서", layout="wide")
 st.title("HWPX > JSON (단원영역별 성취수준, 평가예시)")
 
+# ✅ hwpx만 받기
 uploaded = st.file_uploader(
-    "파일 업로드 (.hwpx 또는 Contents_section*.xml(.txt))",
-    type=["hwpx", "txt", "xml"],
+    "파일 업로드 (.hwpx)",
+    type=["hwpx"],
     accept_multiple_files=True
 )
 
@@ -346,11 +367,12 @@ if st.button("파싱 실행", type="primary"):
         name = f.name
         data = f.read()
 
-        if name.lower().endswith(".hwpx"):
-            results.extend(parse_hwpx_bytes(data))
-        else:
-            xml_text = data.decode("utf-8", errors="replace")
-            results.extend(parse_sections_from_section_xml(xml_text))
+        # ✅ hwpx만 처리
+        if not name.lower().endswith(".hwpx"):
+            st.warning(f"지원하지 않는 파일 형식: {name} (hwpx만 업로드 가능)")
+            continue
+
+        results.extend(parse_hwpx_bytes(data))
 
     json_text = json.dumps(results, ensure_ascii=False, indent=2)
 
