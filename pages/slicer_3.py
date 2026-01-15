@@ -231,6 +231,8 @@ def _find_header_row_for_achievement(matrix: List[List[str]], scan_rows: int = 6
         if col_level is not None and col_desc is not None:
             return (r_idx, col_level, col_desc)
     return None
+
+
 def parse_achievement_table(tbl, nsmap):
     matrix = table_to_matrix(tbl, nsmap)
     if not matrix:
@@ -271,26 +273,43 @@ def _find_header_row_for_assessment(matrix: List[List[str]], scan_rows: int = 6)
     return None
 
 
-def parse_assessment_table(tbl, nsmap):
+def parse_achievement_table(
+    tbl: ET.Element,
+    nsmap: Dict[str, str],
+    extra_level_headers: Optional[List[str]] = None,
+    extra_desc_headers: Optional[List[str]] = None,
+) -> Optional[List[Dict[str, str]]]:
+
     matrix = table_to_matrix(tbl, nsmap)
-    if not matrix:
+    if not matrix or len(matrix) < 2:
         return None
 
+    # ✅ 기본 + 추가 merge
+    level_headers = set(ACH_LEVEL_HEADERS)
+    desc_headers  = set(ACH_DESC_HEADERS)
+
+    if extra_level_headers:
+        level_headers |= { _normalize_header(x) for x in extra_level_headers if x }
+    if extra_desc_headers:
+        desc_headers  |= { _normalize_header(x) for x in extra_desc_headers if x }
+
+    # 헤더 row 스캔
     for r_idx in range(min(6, len(matrix))):
-        header = [_canonize_header(h) for h in matrix[r_idx]]
-        if REQUIRED_ASSESS_CANON.issubset(set(header)):
+        header = [_normalize_header(x) for x in matrix[r_idx]]
+        col_level = next((i for i, h in enumerate(header) if h in level_headers), None)
+        col_desc  = next((i for i, h in enumerate(header) if h in desc_headers), None)
+
+        if col_level is not None and col_desc is not None:
             items = []
             for row in matrix[r_idx+1:]:
-                if len(row) < len(header):
+                if len(row) <= max(col_level, col_desc):
                     continue
-                items.append({
-                    "item_number": _clean_inline(row[header.index(CAN_ITEM)]),
-                    "domain_unit": _clean_inline(row[header.index(CAN_UNIT)]),
-                    "curriculum_code": _clean_inline(row[header.index(CAN_CODE)]),
-                    "assessment_type": _clean_inline(row[header.index(CAN_TYPE)]),
-                    "evaluation_elements": split_eval_elements(row[header.index(CAN_ELEM)])
-                })
+                level = _clean_inline(row[col_level])
+                desc  = _clean_inline(row[col_desc])
+                if level or desc:
+                    items.append({"level": level, "description": desc})
             return items if items else None
+
     return None
 
 
@@ -325,8 +344,15 @@ def iter_outer_paragraphs(root: ET.Element, nsmap: Dict[str, str]):
 # =========================
 # Main parser
 # =========================
-def parse_sections_from_section_xml(section_xml: str, section_no: int = 0) -> List[Dict[str, Any]]:
+def parse_sections_from_section_xml(
+        section_xml: str, 
+        section_no: int = 0,
+        extra_ach_desc_headers: Optional[List[str]] = None, 
+        extra_assess_aliases: Optional[Dict[str, str]] = None,
+    ) -> List[Dict[str, Any]]:    
+    
     root = ET.fromstring(section_xml)
+
     nsmap = {"hp": "http://www.hancom.co.kr/hwpml/2011/paragraph"}
     hp_tbl = _ns("hp:tbl", nsmap)
 
@@ -344,7 +370,10 @@ def parse_sections_from_section_xml(section_xml: str, section_no: int = 0) -> Li
         if tbl is not None:
             ctx = list(recent_paras)
 
-            ach_items = parse_achievement_table(tbl, nsmap)
+            ach_items = parse_achievement_table(
+                tbl, nsmap,
+                    extra_desc_headers=extra_ach_desc_headers)
+            
             if ach_items is not None:
                 title = pick_title_from_context(ctx, "ach")      # ✅ 여기서 정의
                 subtitle = pick_subtitle_from_context(ctx)       # ✅ 여기서 정의
@@ -356,7 +385,10 @@ def parse_sections_from_section_xml(section_xml: str, section_no: int = 0) -> Li
                 })
                 continue
 
-            ass_items = parse_assessment_table(tbl, nsmap)
+            ass_items = parse_assessment_table(
+                tbl, nsmap,
+                extra_aliases=extra_assess_aliases)
+            
             if ass_items is not None:
                 title = pick_title_from_context(ctx, "assess")   # ✅ 여기서 정의
                 subtitle = pick_subtitle_from_context(ctx)
@@ -391,6 +423,89 @@ def parse_sections_from_section_xml(section_xml: str, section_no: int = 0) -> Li
     return results
 
 
+def parse_assessment_table(
+    tbl: ET.Element,
+    nsmap: Dict[str, str],
+    extra_aliases: Optional[Dict[str, str]] = None,
+) -> Optional[List[Dict[str, Any]]]:
+    """
+    평가도구(예시) 표 파싱.
+    - 헤더 행을 앞에서 몇 줄(scan_rows) 스캔하면서 REQUIRED_ASSESS_CANON이 모두 만족되는 행을 찾는다.
+    - extra_aliases가 주어지면(옵션), 기존 ASSESS_HEADER_ALIASES에 합쳐서 추가 변형 헤더도 인식한다.
+
+    extra_aliases 예:
+      {
+        "문항 번호": "문항번호",
+        "평가준거 성취기준 코드": "교육과정성취기준코드"
+      }
+    """
+
+    matrix = table_to_matrix(tbl, nsmap)
+    if not matrix or len(matrix) < 2:
+        return None
+
+    # ✅ 기존 alias + 추가 alias merge (key는 normalize해서 저장)
+    aliases = dict(ASSESS_HEADER_ALIASES)
+    if extra_aliases:
+        for k, v in extra_aliases.items():
+            if not k or not v:
+                continue
+            aliases[_normalize_header(k)] = v  # key normalize
+
+    def canon(h: str) -> str:
+        nh = _normalize_header(h)
+        return aliases.get(nh, nh)
+
+    # ✅ 헤더 행 찾기: 캡션/설명 행이 섞일 수 있어서 앞에서 몇 줄 스캔
+    header_row_idx: Optional[int] = None
+    scan_rows = 6
+    for r_idx in range(min(scan_rows, len(matrix))):
+        header_canon = [canon(h) for h in matrix[r_idx]]
+        if REQUIRED_ASSESS_CANON.issubset(set(header_canon)):
+            header_row_idx = r_idx
+            break
+
+    if header_row_idx is None:
+        return None
+
+    header_canon = [canon(h) for h in matrix[header_row_idx]]
+
+    def idx(can_name: str) -> int:
+        return header_canon.index(can_name)
+
+    col_item = idx(CAN_ITEM)
+    col_unit = idx(CAN_UNIT)
+    col_code = idx(CAN_CODE)
+    col_type = idx(CAN_TYPE)
+    col_elem = idx(CAN_ELEM)
+
+    items: List[Dict[str, Any]] = []
+    for r in matrix[header_row_idx + 1:]:
+        if len(r) <= max(col_item, col_unit, col_code, col_type, col_elem):
+            continue
+
+        item_number = _clean_inline(r[col_item])
+        domain_unit = _clean_inline(r[col_unit])
+        curriculum_code = _clean_inline(r[col_code])
+        assessment_type = _clean_inline(r[col_type])
+        eval_text = _normalize_text(r[col_elem])
+
+        # 빈 행 스킵
+        if not any([item_number, domain_unit, curriculum_code, assessment_type, eval_text]):
+            continue
+
+        items.append({
+            "item_number": item_number,
+            "domain_unit": domain_unit,
+            "curriculum_code": curriculum_code,
+            "assessment_type": assessment_type,
+            "evaluation_elements": split_eval_elements(eval_text),
+        })
+
+    return items if items else None
+
+
+
 
 # =========================
 # HWPX loader (section 순서 보장)
@@ -415,21 +530,31 @@ def read_hwpx_sections_from_bytes(hwpx_bytes: bytes) -> List[Tuple[str, str]]:
         return out
     
 
-def parse_hwpx_bytes(hwpx_bytes: bytes) -> List[Dict[str, Any]]:
+def parse_hwpx_bytes(
+    hwpx_bytes: bytes,
+    extra_ach_desc_headers: Optional[List[str]] = None,
+    extra_assess_aliases: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, Any]]:
+
     all_results: List[Dict[str, Any]] = []
     sections = read_hwpx_sections_from_bytes(hwpx_bytes)
 
     for sec_idx, (_, xml_text) in enumerate(sections):
-        all_results.extend(parse_sections_from_section_xml(xml_text, section_no=sec_idx))
+        all_results.extend(
+            parse_sections_from_section_xml(
+                xml_text,
+                section_no=sec_idx,
+                extra_ach_desc_headers=extra_ach_desc_headers,
+                extra_assess_aliases=extra_assess_aliases,
+            )
+        )
 
-    # ✅ 문서 위치 기준 정렬
     all_results.sort(key=lambda x: x.get("_order", (10**9, 10**9)))
-
-    # ✅ 메타 제거
     for r in all_results:
         r.pop("_order", None)
 
     return all_results
+
 
 
 def to_pretty_json(obj) -> str:
@@ -457,6 +582,35 @@ uploaded = st.file_uploader(
     accept_multiple_files=True
 )
 
+st.sidebar.header("Header overrides (optional)")
+
+# ✅ Achievement(성취수준) - desc 헤더 추가(쉼표로 여러 개)
+extra_ach_desc_raw = st.sidebar.text_input(
+    "Extra ACH desc headers (comma-separated)",
+    value="",
+    placeholder="예: 실용영어_쓰기 영역, 실용영어_읽기 영역"
+).strip()
+
+extra_ach_desc_headers = [x.strip() for x in extra_ach_desc_raw.split(",") if x.strip()]
+
+# ✅ Assessment(평가도구) - 헤더 alias 추가(JSON dict 형태로)
+extra_assess_aliases_raw = st.sidebar.text_area(
+    "Extra ASSESS header aliases (JSON dict)",
+    value="{}",
+    height=140,
+    help='예: {"문항 번호":"문항번호","평가준거 성취기준 코드":"교육과정성취기준코드"}'
+).strip()
+
+try:
+    extra_assess_aliases = json.loads(extra_assess_aliases_raw) if extra_assess_aliases_raw else {}
+    if not isinstance(extra_assess_aliases, dict):
+        st.sidebar.error("Extra ASSESS aliases must be a JSON object (dict).")
+        extra_assess_aliases = {}
+except Exception as e:
+    st.sidebar.error(f"Invalid JSON for extra ASSESS aliases: {e}")
+    extra_assess_aliases = {}
+
+
 if st.button("파싱 실행", type="primary"):
     if not uploaded:
         st.warning("파일을 먼저 업로드해줘.")
@@ -467,7 +621,11 @@ if st.button("파싱 실행", type="primary"):
     for f in uploaded:
         name = f.name
         data = f.read()
-        all_files_results[name] = parse_hwpx_bytes(data)
+        all_files_results[f.name] = parse_hwpx_bytes(
+            data,
+            extra_ach_desc_headers=extra_ach_desc_headers,
+            extra_assess_aliases=extra_assess_aliases,
+        )
 
     # 화면 표시(다운로드 없이)
     st.subheader("파일별 결과")
