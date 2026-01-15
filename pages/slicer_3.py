@@ -1,6 +1,6 @@
 # app.py
 import re
-import json
+import json, textwrap
 import zipfile
 import io
 import xml.etree.ElementTree as ET
@@ -32,6 +32,11 @@ def _clean_inline(s: str) -> str:
     s = s.replace("", "·")  # (서논술형) -> (서·논술형)
     s = re.sub(r"\s+", " ", s)
     return s
+
+def _is_table_caption(s: str) -> bool:
+    s = _clean_inline(s)
+    return s.startswith("<표")  # "<표 1>", "<표1>" 등 포함
+
 
 # --- add: heading helpers (near configs) ---
 HEADING_MAX_LEN = 80  # 너무 긴 문단은 제목/소제목 후보에서 제외(오탐 방지)
@@ -75,6 +80,35 @@ def detect_title_type(para_text: str) -> Optional[Tuple[str, str]]:
 # =========================
 # XML extraction helpers
 # =========================
+from collections import deque
+
+TITLE_HINT_ACH = ("성취수준", "성취 수준")
+TITLE_HINT_ASS = ("평가도구", "평가 도구")
+
+
+def pick_title_from_context(ctx, table_type: str) -> str:
+    hints = TITLE_HINT_ACH if table_type == "ach" else TITLE_HINT_ASS
+
+    for t in reversed(ctx):  # 최근 문단부터
+        clean = _clean_inline(t)
+
+        # ✅ 표 캡션이면 title 후보에서 제외
+        if _is_table_caption(clean):
+            continue
+
+        if any(h in clean for h in hints):
+            return clean
+
+    return ""
+
+
+def pick_subtitle_from_context(ctx) -> str:
+    for t in reversed(ctx):
+        clean = _clean_inline(t)
+        if SUBTITLE_RE.match(clean):
+            return clean
+    return ""
+
 def extract_all_hp_text(elem: ET.Element, nsmap: Dict[str, str]) -> List[str]:
     """
     ✅ 핵심 수정:
@@ -291,55 +325,53 @@ def iter_outer_paragraphs(root: ET.Element, nsmap: Dict[str, str]):
 # =========================
 # Main parser
 # =========================
-def parse_sections_from_section_xml(section_xml: str) -> List[Dict[str, Any]]:
+def parse_sections_from_section_xml(section_xml: str, section_no: int = 0) -> List[Dict[str, Any]]:
     root = ET.fromstring(section_xml)
     nsmap = {"hp": "http://www.hancom.co.kr/hwpml/2011/paragraph"}
     hp_tbl = _ns("hp:tbl", nsmap)
 
     results: List[Dict[str, Any]] = []
 
-    # ✅ “있으면” 쓰고, 없으면 ""로 처리할 컨텍스트
-    last_title_type: Optional[str] = None   # "ach" | "assess"
-    last_title_text: str = ""              # 규칙 맞으면 채움
-    pending_subtitle: str = ""             # 규칙 맞으면 채움
+    # ✅ “표 앞쪽 텍스트” 컨텍스트 버퍼
+    recent_paras = deque(maxlen=12)
 
+    para_no = -1
     for p in iter_outer_paragraphs(root, nsmap):
+        para_no += 1
         tbl = p.find(".//" + hp_tbl)
 
-        # =========================
-        # (A) 표 문단: ✅ 무조건 헤더로 판별/파싱
-        # =========================
+        # (A) 표 문단: ✅ 표 헤더로 ach/ass 판별 후 무조건 파싱
         if tbl is not None:
+            ctx = list(recent_paras)
+
             ach_items = parse_achievement_table(tbl, nsmap)
             if ach_items is not None:
-                title = last_title_text if last_title_type == "ach" else ""
-                subtitle = pending_subtitle  # 없으면 이미 ""
+                title = pick_title_from_context(ctx, "ach")      # ✅ 여기서 정의
+                subtitle = pick_subtitle_from_context(ctx)       # ✅ 여기서 정의
                 results.append({
-                    "title": title,
-                    "subtitle": subtitle,
+                    "_order": (section_no, para_no),
+                    "title": title,          # 규칙 불일치면 ""
+                    "subtitle": subtitle,    # 규칙 불일치면 ""
                     "achievement_levels": ach_items
                 })
-                pending_subtitle = ""  # 표 하나에 subtitle 소비
                 continue
 
             ass_items = parse_assessment_table(tbl, nsmap)
             if ass_items is not None:
-                title = last_title_text if last_title_type == "assess" else ""
-                subtitle = pending_subtitle
+                title = pick_title_from_context(ctx, "assess")   # ✅ 여기서 정의
+                subtitle = pick_subtitle_from_context(ctx)
                 results.append({
+                    "_order": (section_no, para_no),
                     "title": title,
                     "subtitle": subtitle,
                     "assessment_items": ass_items
                 })
-                pending_subtitle = ""
                 continue
 
             # ach/ass 헤더가 아니면 무시
             continue
 
-        # =========================
-        # (B) 일반 문단: title/subtitle만 “규칙 맞으면” 저장
-        # =========================
+        # (B) 일반 문단: recent_paras에만 쌓아두기
         texts = extract_all_hp_text(p, nsmap)
         if not texts:
             continue
@@ -348,29 +380,13 @@ def parse_sections_from_section_xml(section_xml: str) -> List[Dict[str, Any]]:
         if not para_text:
             continue
 
-        # 큰 섹션 리셋(원래 로직 유지)
+        # 섹션 리셋(부록/참고 등)
         if para_text.startswith(RESET_SECTION_PREFIXES):
-            last_title_type = None
-            last_title_text = ""
-            pending_subtitle = ""
+            recent_paras.clear()
             continue
 
-        # 너무 긴 문단은 heading 후보에서 제외(원래 기준 유지)
-        if len(para_text) <= HEADING_MAX_LEN:
-            # title: detect 규칙에 맞을 때만 반영, 아니면 그대로(= 공백 유지 가능)
-            hit = detect_title_type(para_text)
-            if hit:
-                last_title_type, last_title_text = hit  # 규칙 맞는 제목만 저장
-                pending_subtitle = ""                   # 새 title 시작이면 subtitle 초기화
-                continue
-
-            # subtitle: (숫자) 규칙에 맞을 때만 저장
-            if SUBTITLE_RE.match(para_text):
-                pending_subtitle = para_text
-                continue
-
-        # 그 외 텍스트는 title/subtitle로 취급하지 않음(= "" 유지)
-        continue
+        # 너무 긴 문단은 컨텍스트에 넣어도 되지만, 잡음이면 제외하고 싶으면 여기서 컷 가능
+        recent_paras.append(para_text)
 
     return results
 
@@ -397,13 +413,37 @@ def read_hwpx_sections_from_bytes(hwpx_bytes: bytes) -> List[Tuple[str, str]]:
             xml_text = z.read(name).decode("utf-8", errors="replace")
             out.append((name, xml_text))
         return out
+    
 
 def parse_hwpx_bytes(hwpx_bytes: bytes) -> List[Dict[str, Any]]:
     all_results: List[Dict[str, Any]] = []
-    for _, xml_text in read_hwpx_sections_from_bytes(hwpx_bytes):
-        all_results.extend(parse_sections_from_section_xml(xml_text))
+    sections = read_hwpx_sections_from_bytes(hwpx_bytes)
+
+    for sec_idx, (_, xml_text) in enumerate(sections):
+        all_results.extend(parse_sections_from_section_xml(xml_text, section_no=sec_idx))
+
+    # ✅ 문서 위치 기준 정렬
+    all_results.sort(key=lambda x: x.get("_order", (10**9, 10**9)))
+
+    # ✅ 메타 제거
+    for r in all_results:
+        r.pop("_order", None)
+
     return all_results
 
+
+def to_pretty_json(obj) -> str:
+    return json.dumps(obj, ensure_ascii=False, indent=2)
+
+def wrap_long_lines(s: str, width: int = 120) -> str:
+    # 이미 indent로 줄이 나뉘지만, description 같은 긴 문자열이 한 줄로 길어질 수 있어서 추가로 감쌈
+    out_lines = []
+    for line in s.splitlines():
+        if len(line) <= width:
+            out_lines.append(line)
+        else:
+            out_lines.extend(textwrap.wrap(line, width=width, break_long_words=False, break_on_hyphens=False))
+    return "\n".join(out_lines)
 
 # =========================
 # Streamlit UI
@@ -438,12 +478,14 @@ if st.button("파싱 실행", type="primary"):
         st.caption(f"achievement: {ach_cnt}개, assessment: {ass_cnt}개, total: {len(results)}개")
         tab1, tab2, tab3 = st.tabs(["Achievement", "Assessment", "All"])
 
-        with tab1:
-            st.json([r for r in results if "achievement_levels" in r])
+    ach = [r for r in results if "achievement_levels" in r]
+    ass = [r for r in results if "assessment_items" in r]
 
-        with tab2:
-            st.json([r for r in results if "assessment_items" in r])
+    with tab1:
+        st.code(wrap_long_lines(to_pretty_json(ach), 120), language="json")
 
-        with tab3:
-            st.json(results)
+    with tab2:
+        st.code(wrap_long_lines(to_pretty_json(ass), 120), language="json")
 
+    with tab3:
+        st.code(wrap_long_lines(to_pretty_json(results), 120), language="json")
