@@ -105,6 +105,8 @@ def pick_title_from_context(ctx, table_type: str) -> str:
 def pick_subtitle_from_context(ctx) -> str:
     for t in reversed(ctx):
         clean = _clean_inline(t)
+        if _is_table_caption(clean):
+            continue
         if SUBTITLE_RE.match(clean):
             return clean
     return ""
@@ -127,7 +129,7 @@ def extract_all_hp_text(elem: ET.Element, nsmap: Dict[str, str]) -> List[str]:
 
 def extract_cell_text(tc: ET.Element, nsmap: Dict[str, str]) -> str:
     parts = extract_all_hp_text(tc, nsmap)
-    return _normalize_text("\n".join(parts))
+    return _normalize_text(" ".join(parts))
 
 def table_to_matrix(tbl: ET.Element, nsmap: Dict[str, str]) -> List[List[str]]:
     hp_tr = _ns("hp:tr", nsmap)
@@ -233,30 +235,6 @@ def _find_header_row_for_achievement(matrix: List[List[str]], scan_rows: int = 6
     return None
 
 
-def parse_achievement_table(tbl, nsmap):
-    matrix = table_to_matrix(tbl, nsmap)
-    if not matrix:
-        return None
-
-    for r_idx in range(min(6, len(matrix))):
-        header = [_normalize_header(x) for x in matrix[r_idx]]
-        col_level = next((i for i,h in enumerate(header) if h in ACH_LEVEL_HEADERS), None)
-        col_desc  = next((i for i,h in enumerate(header) if h in ACH_DESC_HEADERS), None)
-
-        if col_level is not None and col_desc is not None:
-            items = []
-            for row in matrix[r_idx+1:]:
-                if len(row) <= max(col_level, col_desc):
-                    continue
-                level = _clean_inline(row[col_level])
-                desc  = _clean_inline(row[col_desc])
-                if level or desc:
-                    items.append({"level": level, "description": desc})
-            return items if items else None
-
-    return None
-
-
 def _canonize_header(h: str) -> str:
     nh = _normalize_header(h)
     return ASSESS_HEADER_ALIASES.get(nh, nh)
@@ -349,7 +327,7 @@ def parse_sections_from_section_xml(
         section_no: int = 0,
         extra_ach_desc_headers: Optional[List[str]] = None, 
         extra_assess_aliases: Optional[Dict[str, str]] = None,
-    ) -> List[Dict[str, Any]]:    
+) -> List[Dict[str, Any]]:    
     
     root = ET.fromstring(section_xml)
 
@@ -372,7 +350,8 @@ def parse_sections_from_section_xml(
 
             ach_items = parse_achievement_table(
                 tbl, nsmap,
-                    extra_desc_headers=extra_ach_desc_headers)
+                extra_desc_headers=extra_ach_desc_headers
+            )
             
             if ach_items is not None:
                 title = pick_title_from_context(ctx, "ach")      # ✅ 여기서 정의
@@ -387,7 +366,8 @@ def parse_sections_from_section_xml(
 
             ass_items = parse_assessment_table(
                 tbl, nsmap,
-                extra_aliases=extra_assess_aliases)
+                extra_aliases=extra_assess_aliases
+            )
             
             if ass_items is not None:
                 title = pick_title_from_context(ctx, "assess")   # ✅ 여기서 정의
@@ -574,6 +554,19 @@ def wrap_long_lines(s: str, width: int = 120) -> str:
 # Streamlit UI
 # =========================
 st.set_page_config(page_title="HWPX 파서", layout="wide")
+st.markdown(
+    """
+    <style>
+    /* st.code 블록에서 화면 표시만 줄바꿈 */
+    div[data-testid="stCodeBlock"] pre {
+        white-space: pre-wrap !important;
+        word-break: break-word !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
 st.title("HWPX > JSON (단원영역별 성취수준, 평가예시)")
 
 uploaded = st.file_uploader(
@@ -629,21 +622,24 @@ if st.button("파싱 실행", type="primary"):
 
     # 화면 표시(다운로드 없이)
     st.subheader("파일별 결과")
+
     for fname, results in all_files_results.items():
         ach_cnt = sum(1 for x in results if "achievement_levels" in x)
         ass_cnt = sum(1 for x in results if "assessment_items" in x)
+
         st.markdown(f"### {fname}")
         st.caption(f"achievement: {ach_cnt}개, assessment: {ass_cnt}개, total: {len(results)}개")
+
         tab1, tab2, tab3 = st.tabs(["Achievement", "Assessment", "All"])
 
-    ach = [r for r in results if "achievement_levels" in r]
-    ass = [r for r in results if "assessment_items" in r]
+        ach = [r for r in results if "achievement_levels" in r]
+        ass = [r for r in results if "assessment_items" in r]
 
-    with tab1:
-        st.code(wrap_long_lines(to_pretty_json(ach), 120), language="json")
+        with tab1:
+            st.code(to_pretty_json(ach), language="json")
 
-    with tab2:
-        st.code(wrap_long_lines(to_pretty_json(ass), 120), language="json")
+        with tab2:
+            st.code(to_pretty_json(ass), language="json")
 
-    with tab3:
-        st.code(wrap_long_lines(to_pretty_json(results), 120), language="json")
+        with tab3:
+            st.code(to_pretty_json(results), language="json")
