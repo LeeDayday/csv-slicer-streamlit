@@ -231,35 +231,89 @@ def detect_major_by_title_table(tbl: ET.Element) -> Optional[str]:
         return "3"
     return None
 
-
 # =========================
-# 2022: Subject detection
+# 2022: Subject detection (REWRITE)
 # =========================
-SUBJECT_LINE_RE = re.compile(r"^\s*(.+?)\s*성취수준\s*$")
 
-def detect_subject_line(para_text: str) -> Optional[str]:
+# 로마자(Ⅰ~Ⅻ 정도) + "." + 과목명
+ROMAN_DOT_SUBJECT_RE = re.compile(r"^\s*([ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ]+)\s*[\.\)]\s*(.+?)\s*$")
+
+# (과목명) 성취수준
+SUBJECT_LEVEL_RE = re.compile(r"^\s*(.+?)\s*성취수준\s*$")
+
+# 로마자만 단독으로 있는 줄 (Ⅳ)
+ROMAN_ONLY_RE = re.compile(r"^\s*([ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ]+)\s*$")
+
+
+def _is_banned_subject_candidate(t: str) -> bool:
+    """표지2/공통 문구 제거"""
+    if not t:
+        return True
+
+    # 강력 제외 키워드
+    ban = ["2022", "개정 교육과정", "교육과정에 따른"]
+    if any(b in t for b in ban):
+        return True
+
+    # "고등학교 ... 선택과목 성취수준" 류 제거
+    norm = t.replace(" ", "")
+    if ("고등학교" in norm) and (("선택과목" in norm) or ("공통과목" in norm)):
+        return True
+    if ("계열(" in norm) and ("선택과목" in norm):
+        return True
+
+    # 너무 일반 단어 방지
+    if norm in {"성취수준", "영역", "(영역)"}:
+        return True
+
+    return False
+
+
+def _clean_subject_name(name: str) -> str:
+    name = _clean_inline(name)
+    name = name.replace("성취수준", "").strip()
+    # 앞쪽 로마자 제거(혹시 붙어있으면)
+    name = name.strip("ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ ").strip()
+    # 앞에 '.' 같은 게 남아있으면 제거
+    name = re.sub(r"^[\.\)\]]\s*", "", name).strip()
+    return name
+
+
+def detect_subject_event(prev_texts: deque, para_text: str) -> Optional[str]:
+    """
+    한 문단(para_text) 기준으로 subject 후보를 뽑는다.
+    - 1) "Ⅳ. 과목명"
+    - 2) "과목명 성취수준"
+    - 3) 직전 로마자 단독(Ⅳ)이 있었고, 이번 줄이 "과목명 성취수준"이면 확정
+    """
     t = _clean_inline(para_text)
     if not t:
         return None
 
-    ban = ["2022", "개정 교육과정", "교육과정에 따른"]
-    if any(b in t for b in ban):
-        return None
+    # 1) 로마자. 과목명
+    m1 = ROMAN_DOT_SUBJECT_RE.match(t)
+    if m1:
+        subj = _clean_subject_name(m1.group(2))
+        if subj and not _is_banned_subject_candidate(subj):
+            return subj
 
-    m = SUBJECT_LINE_RE.match(t)
-    if not m:
-        return None
+    # 2) 과목명 성취수준
+    m2 = SUBJECT_LEVEL_RE.match(t)
+    if m2:
+        candidate = _clean_subject_name(m2.group(1))
+        if not candidate or _is_banned_subject_candidate(candidate):
+            return None
 
-    subject = _clean_inline(m.group(1))
-    if len(subject) < 2:
-        return None
+        # 3) 직전에 로마자만 있었던 경우면 더 신뢰
+        if prev_texts:
+            prev = _clean_inline(prev_texts[-1])
+            if ROMAN_ONLY_RE.match(prev):
+                return candidate
 
-    subject = subject.strip("ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ ").strip()
-    if not subject or subject in {"(영역)", "영역"}:
-        return None
+        # 로마자 없이 "OO 성취수준"만 나와도 후보로는 인정 (표지1/표지3 대응)
+        return candidate
 
-    return subject
-
+    return None
 
 # =========================
 # 2022: Achievement parsing
@@ -498,6 +552,10 @@ def parse_2022(hwpx_bytes: bytes, extra_assess_aliases: Optional[Dict[str, str]]
 
             # ---------- TABLE ----------
             if tbl is not None:
+                # ✅ 어떤 major이든, 테이블을 만나기 직전에 pending_subject가 있으면 커밋
+                if pending_subject:
+                    current_subject = pending_subject
+                    pending_subject = None
                 # ✅ 핵심 패치: major 판정은 "진짜 1행2열 타이틀 표"만 사용
                 major = detect_major_by_title_table(tbl)
                 if major:
@@ -554,11 +612,12 @@ def parse_2022(hwpx_bytes: bytes, extra_assess_aliases: Optional[Dict[str, str]]
             if not para_text or _is_table_caption(para_text):
                 continue
 
-            subj = detect_subject_line(para_text)
+            subj = detect_subject_event(recent_paras, para_text)
             if subj:
                 pending_subject = subj
                 recent_paras.append(para_text)
                 continue
+
 
             m = RE_MAJOR.match(para_text)
             if m:
