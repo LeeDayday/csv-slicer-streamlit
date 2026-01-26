@@ -86,10 +86,6 @@ def table_to_matrix(tbl: ET.Element) -> List[List[str]]:
     return rows
 
 def iter_outer_paragraphs(root: ET.Element):
-    """
-    표 안쪽(hp:tbl/hp:tc 내부)의 hp:p는 제외하고,
-    문서 본문(바깥) 문단만 순회
-    """
     parent = {}
     for par in root.iter():
         for ch in list(par):
@@ -208,6 +204,12 @@ def table_text_flat(tbl: ET.Element) -> str:
     return re.sub(r"\s+", " ", flat).strip()
 
 def detect_major_by_title_table(tbl: ET.Element) -> Optional[str]:
+    """
+    ✅ "진짜 목차 타이틀 표"만 major로 인정
+    - 1행 2열
+    - left가 1/2/3
+    - right가 해당 제목
+    """
     if tbl.get("rowCnt") != "1" or tbl.get("colCnt") != "2":
         return None
 
@@ -229,22 +231,10 @@ def detect_major_by_title_table(tbl: ET.Element) -> Optional[str]:
         return "3"
     return None
 
-def detect_major_by_any_table(tbl: ET.Element) -> Optional[str]:
-    flat = table_text_flat(tbl).replace(" ", "")
-    if "1" in flat and "성취기준별" in flat and "성취수준" in flat:
-        return "1"
-    if "2" in flat and "영역별성취수준" in flat:
-        return "2"
-    if "3" in flat and "예시" in flat and "평가" in flat and "도구" in flat:
-        return "3"
-    return None
-
 
 # =========================
 # 2022: Subject detection
 # =========================
-# 네가 말한 "2022 개정 교육과정에 따른 ___ 성취수준"은 제외해야 함.
-# 그래서 '2022', '개정 교육과정', '교육과정에 따른' 같은 키워드가 들어가면 subject 후보에서 제외.
 SUBJECT_LINE_RE = re.compile(r"^\s*(.+?)\s*성취수준\s*$")
 
 def detect_subject_line(para_text: str) -> Optional[str]:
@@ -252,7 +242,6 @@ def detect_subject_line(para_text: str) -> Optional[str]:
     if not t:
         return None
 
-    # 제외 규칙 (헷갈리는 문장 차단)
     ban = ["2022", "개정 교육과정", "교육과정에 따른"]
     if any(b in t for b in ban):
         return None
@@ -262,11 +251,9 @@ def detect_subject_line(para_text: str) -> Optional[str]:
         return None
 
     subject = _clean_inline(m.group(1))
-    # 너무 짧거나 의미 없는 값 방지
     if len(subject) < 2:
         return None
 
-    # 혹시 "Ⅰ" 같은 로마자만 있는 경우 등 제거(원하면 더 강화 가능)
     subject = subject.strip("ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ ").strip()
     if not subject or subject in {"(영역)", "영역"}:
         return None
@@ -318,11 +305,6 @@ def _should_skip_by_level_guide(ctx: List[str], matrix: List[List[str]]) -> bool
     return False
 
 def parse_ach_grid(grid: List[List[str]]) -> Tuple[Dict[str, Dict[str, Dict[str, str]]], str]:
-    """
-    return:
-      parsed = { area: { level: { category: desc } } }
-      first_area = 첫 번째 영역 텍스트 (디버깅/검증용)
-    """
     if not grid:
         return {}, ""
 
@@ -388,11 +370,10 @@ def parse_achievement_table_2022(tbl: ET.Element, ctx: List[str]) -> Optional[Di
     if not items:
         return None
 
-    # domain은 최종 구조에 포함하지 않음 (요구사항)
     return {
-        "_first_area": first_area,  # 내부 검증/디버깅용 (최종 출력에서 제거)
+        "_first_area": first_area,
         "title": "2 영역별 성취수준",
-        "subtitle": "",            # parse_2022에서 채움
+        "subtitle": "",
         "achievement_levels": items
     }
 
@@ -420,7 +401,6 @@ ASSESS_HEADER_ALIASES = {
     _normalize_header("평가요소"): CAN_ELEM,
     _normalize_header("평가 요소"): CAN_ELEM,
 
-    # 2022 변형
     _normalize_header("번호"): CAN_ITEM,
     _normalize_header("성취기준"): CAN_CODE,
     _normalize_header("평가 도구 유형"): CAN_TYPE,
@@ -494,7 +474,7 @@ def parse_assessment_table(tbl: ET.Element, extra_aliases: Optional[Dict[str, st
 
 
 # =========================
-# Main parse_2022 (structure exactly as user described)
+# Main parse_2022
 # =========================
 def parse_2022(hwpx_bytes: bytes, extra_assess_aliases: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
@@ -518,24 +498,21 @@ def parse_2022(hwpx_bytes: bytes, extra_assess_aliases: Optional[Dict[str, str]]
 
             # ---------- TABLE ----------
             if tbl is not None:
-                major = detect_major_by_title_table(tbl) or detect_major_by_any_table(tbl)
+                # ✅ 핵심 패치: major 판정은 "진짜 1행2열 타이틀 표"만 사용
+                major = detect_major_by_title_table(tbl)
                 if major:
                     current_major = major
                     recent_paras.clear()
 
-                    # ✅ (핵심) "1 성취기준별 성취수준" 표를 만나는 순간에 과목 확정
                     if major == "1":
                         if pending_subject:
                             current_subject = pending_subject
                             pending_subject = None
-                        # 이 구간 표는 파싱하지 않으니 subtitle도 초기화
                         last_subtitle = ""
 
-                    # ✅ 2 구간 시작: subtitle은 표 사이 문단에서 직접 들어오므로 초기화
                     elif major == "2":
                         last_subtitle = ""
 
-                    # ✅ 3 구간 시작: subtitle 고정
                     elif major == "3":
                         last_subtitle = "가. 예시 평가 도구 개요"
 
@@ -545,15 +522,12 @@ def parse_2022(hwpx_bytes: bytes, extra_assess_aliases: Optional[Dict[str, str]]
                 if current_major == "2":
                     ach_obj = parse_achievement_table_2022(tbl, ctx=list(recent_paras))
                     if ach_obj is not None:
-                        # subtitle은 "직전에 읽은 (숫자) 문장"을 그대로 사용
                         ach_obj["title"] = "2 영역별 성취수준"
-                        ach_obj["subtitle"] = last_subtitle  # 없으면 "" 그대로(디버깅에 좋음)
+                        ach_obj["subtitle"] = last_subtitle  # "(n) 문장" 그대로
 
-                        # UI grouping용 (최종 출력에서 제거)
                         ach_obj["_subject"] = current_subject
                         ach_obj["_order"] = (sec_idx, para_no)
 
-                        # 내부 디버깅 키 제거는 나중에
                         results.append(ach_obj)
                         continue
 
@@ -565,12 +539,11 @@ def parse_2022(hwpx_bytes: bytes, extra_assess_aliases: Optional[Dict[str, str]]
                             "_subject": current_subject,
                             "_order": (sec_idx, para_no),
                             "title": "3 예시 평가 도구",
-                            "subtitle": last_subtitle,  # 고정
+                            "subtitle": last_subtitle,
                             "assessment_items": ass_items
                         })
                         continue
 
-                # 그 외 표는 무시
                 continue
 
             # ---------- PARAGRAPH ----------
@@ -581,19 +554,16 @@ def parse_2022(hwpx_bytes: bytes, extra_assess_aliases: Optional[Dict[str, str]]
             if not para_text or _is_table_caption(para_text):
                 continue
 
-            # ✅ 과목 후보 문장: "OOOO 성취수준" (단, 헷갈리는 문장 제외)
             subj = detect_subject_line(para_text)
             if subj:
                 pending_subject = subj
                 recent_paras.append(para_text)
                 continue
 
-            # ✅ 섹션 헤딩(문단형)도 혹시 있으면 처리 (표형이 아니라 문단형일 수도 있어서)
             m = RE_MAJOR.match(para_text)
             if m:
                 current_major = m.group(1)
                 recent_paras.clear()
-                # 3은 subtitle 고정, 2는 초기화, 1은 pending_subject를 다음에 표로 확정하는게 원칙
                 if current_major == "2":
                     last_subtitle = ""
                 elif current_major == "3":
@@ -603,25 +573,22 @@ def parse_2022(hwpx_bytes: bytes, extra_assess_aliases: Optional[Dict[str, str]]
                 recent_paras.append(para_text)
                 continue
 
-            # ✅ (2 구간) subtitle 문단: "(숫자) 문장" => 다음 ach table의 subtitle
             if current_major == "2" and RE_SUBTITLE.match(para_text):
-                last_subtitle = para_text  # 숫자 포함 원문 그대로
+                last_subtitle = para_text
                 recent_paras.append(para_text)
                 continue
 
             recent_paras.append(para_text)
 
-    # 정렬 + 내부 키 정리
     results.sort(key=lambda x: x.get("_order", (10**9, 10**9)))
     for r in results:
         r.pop("_order", None)
-        r.pop("_first_area", None)  # achievement 내부 디버그용
+        r.pop("_first_area", None)
     return results
 
-from collections import OrderedDict
 
 # =========================
-# Streamlit UI (subject별 출력, 최종 JSON엔 subject 없음)
+# Streamlit UI
 # =========================
 st.set_page_config(page_title="HWPX 파서 (2015/2022)", layout="wide")
 st.title("HWPX > JSON 파서")
@@ -640,28 +607,19 @@ st.markdown(
 
 # ---------- session state init ----------
 if "parsed_grouped_by_file" not in st.session_state:
-    # { filename: OrderedDict(subject -> list[blocks]) }
     st.session_state.parsed_grouped_by_file = {}
-
 if "parsed_results_by_file" not in st.session_state:
-    # { filename: list[blocks] }
     st.session_state.parsed_results_by_file = {}
-
 if "selected_file" not in st.session_state:
     st.session_state.selected_file = None
-
 if "subject_query" not in st.session_state:
     st.session_state.subject_query = ""
-
 if "show_all_subjects" not in st.session_state:
     st.session_state.show_all_subjects = False
-
 if "selected_subject" not in st.session_state:
     st.session_state.selected_subject = None
 
-
 mode = st.sidebar.radio("Mode", ["2022", "2015 (placeholder)"], index=0)
-
 uploaded = st.file_uploader("파일 업로드 (.hwpx)", type=["hwpx"], accept_multiple_files=True)
 
 st.sidebar.header("Assessment header overrides (optional)")
@@ -681,14 +639,12 @@ except Exception as e:
     st.sidebar.error(f"Invalid JSON for extra ASSESS aliases: {e}")
     extra_assess_aliases = {}
 
-
 def group_by_subject(results: List[Dict[str, Any]]) -> "OrderedDict[str, List[Dict[str, Any]]]":
     grouped: "OrderedDict[str, List[Dict[str, Any]]]" = OrderedDict()
     for r in results:
         subj = r.get("_subject", "UNKNOWN")
         grouped.setdefault(subj, []).append(r)
     return grouped
-
 
 # ---------- parse button (ONLY parse + store) ----------
 if st.button("파싱 실행", type="primary"):
@@ -701,31 +657,24 @@ if st.button("파싱 실행", type="primary"):
 
     for f in uploaded:
         data = f.read()
-
-        if mode == "2022":
-            results = parse_2022(data, extra_assess_aliases=extra_assess_aliases)
-        else:
-            results = []
+        results = parse_2022(data, extra_assess_aliases=extra_assess_aliases) if mode == "2022" else []
 
         st.session_state.parsed_results_by_file[f.name] = results
         st.session_state.parsed_grouped_by_file[f.name] = group_by_subject(results)
 
-    # 기본 파일/과목 선택 세팅
     first_file = next(iter(st.session_state.parsed_grouped_by_file.keys()), None)
     st.session_state.selected_file = first_file
     if first_file:
         subjects = list(st.session_state.parsed_grouped_by_file[first_file].keys())
         st.session_state.selected_subject = subjects[0] if subjects else None
 
-
-# ---------- render (works even after sidebar changes) ----------
+# ---------- render ----------
 if not st.session_state.parsed_grouped_by_file:
     st.info("파일 업로드 후 '파싱 실행'을 눌러줘.")
     st.stop()
 
 file_names = list(st.session_state.parsed_grouped_by_file.keys())
 
-# 파일 선택(복수 업로드 대비)
 selected_file = st.selectbox(
     "결과를 볼 파일",
     file_names,
@@ -739,7 +688,6 @@ results = st.session_state.parsed_results_by_file[selected_file]
 st.markdown(f"## {selected_file}")
 st.caption(f"subjects: {len(grouped)}개, total blocks: {len(results)}개")
 
-# ✅ 사이드바: 과목 검색 + 선택 + 전체보기 토글 (버튼 밖!)
 st.sidebar.subheader("과목별 조회")
 
 q = st.sidebar.text_input("과목 검색", value=st.session_state.subject_query, key="subject_query")
@@ -752,7 +700,6 @@ if not filtered_subjects:
     st.warning("검색 결과가 없어. 검색어를 지우거나 바꿔줘.")
     st.stop()
 
-# 선택 과목이 필터에서 사라졌으면 첫 항목으로 보정
 if st.session_state.selected_subject not in filtered_subjects:
     st.session_state.selected_subject = filtered_subjects[0]
 
@@ -765,11 +712,9 @@ selected_subject = st.sidebar.selectbox(
 
 subjects_to_render = filtered_subjects if show_all else [selected_subject]
 
-# ✅ 선택 과목만 렌더링
 for subj in subjects_to_render:
     items = grouped[subj]
 
-    # 최종 출력에서는 subject 필드 제거
     cleaned_items = []
     for it in items:
         it2 = dict(it)
