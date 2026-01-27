@@ -43,14 +43,24 @@ def _is_table_caption(s: str) -> bool:
 def to_pretty_json(obj) -> str:
     return json.dumps(obj, ensure_ascii=False, indent=2)
 
+LEADING_BULLET_RE = re.compile(r"^\s*[◦○•∙●]\s*")
+
+def strip_leading_bullet(s: str) -> str:
+    return LEADING_BULLET_RE.sub("", _clean_inline(s)).strip()
+
+
 def split_eval_elements(text: str) -> List[str]:
     t = _normalize_text(text)
     if not t:
         return []
-    if any(b in t for b in ["◦", "○", "•", "∙"]):
-        parts = re.split(r"(?:^|\n)\s*[◦○•∙]\s*", "\n" + t)
-        return [_clean_inline(p) for p in parts if p.strip()]
-    return [_clean_inline(p) for p in t.split("\n") if p.strip()]
+
+    bullets = ["◦", "○", "•", "∙", "●"]
+    if any(b in t for b in bullets):
+        parts = re.split(r"(?:^|\n)\s*[◦○•∙●]\s*", "\n" + t)
+        return [strip_leading_bullet(p) for p in parts if p.strip()]
+
+    # 불렛 없는 경우: 줄 단위로
+    return [strip_leading_bullet(p) for p in t.split("\n") if p.strip()]
 
 
 # =========================
@@ -63,6 +73,21 @@ HP_TC  = _ns("hp:tc", NSMAP)
 HP_T   = _ns("hp:t", NSMAP)
 HP_P   = _ns("hp:p", NSMAP)
 
+def table_to_tc_matrix(tbl: ET.Element) -> List[List[ET.Element]]:
+    """
+    테이블을 (row -> col) 형태로 tc element 자체를 보존한 매트릭스로 만든다.
+    table_to_matrix()는 text만 남기므로, 특정 컬럼을 문단 단위로 파싱하려면 tc가 필요함.
+    """
+    rows: List[List[ET.Element]] = []
+    for tr in tbl.iter(HP_TR):
+        row = []
+        for tc in tr.findall(HP_TC):
+            row.append(tc)
+        if row:
+            rows.append(row)
+    return rows
+
+
 def extract_all_hp_text(elem: ET.Element) -> List[str]:
     out: List[str] = []
     for t in elem.iter(HP_T):
@@ -74,6 +99,19 @@ def extract_all_hp_text(elem: ET.Element) -> List[str]:
 def extract_cell_text(tc: ET.Element) -> str:
     parts = extract_all_hp_text(tc)
     return _normalize_text(" ".join(parts))
+
+
+def extract_cell_paragraphs(tc: ET.Element) -> List[str]:
+    paras = []
+    for p in tc.findall(".//hp:p", NS):
+        texts = []
+        for t in p.iter(HP_T):
+            if t.text:
+                texts.append(t.text.strip())
+        joined = _clean_inline(" ".join(texts))
+        if joined:
+            paras.append(joined)
+    return paras
 
 def table_to_matrix(tbl: ET.Element) -> List[List[str]]:
     rows: List[List[str]] = []
@@ -229,6 +267,47 @@ def detect_major_by_title_table(tbl: ET.Element) -> Optional[str]:
         return "2"
     if left_num == "3" and ("예시" in right_norm and "평가" in right_norm and "도구" in right_norm):
         return "3"
+    return None
+
+
+def detect_section_by_title_table(tbl: ET.Element) -> Optional[str]:
+    """
+    1행 2열 '목차 타이틀 표'를 보고 섹션 의미를 결정한다.
+    - left 숫자(1/2/3)는 참고만 하고,
+    - right 텍스트가 무엇인지로 achievement/assessment를 판단한다.
+
+    return:
+      - "standard"      (1 성취기준별 성취수준)  # 지금은 사용 안 해도 됨
+      - "achievement"   (영역별 성취수준)
+      - "assessment"    (예시 평가 도구)
+      - None
+    """
+    if tbl.get("rowCnt") != "1" or tbl.get("colCnt") != "2":
+        return None
+
+    m = table_to_matrix(tbl)
+    if not m or len(m[0]) < 2:
+        return None
+
+    left = _clean_inline(m[0][0])
+    right = _clean_inline(m[0][1])
+
+    left_num = re.sub(r"\D", "", left)  # "2", "3" 등
+    right_norm = right.replace(" ", "")
+
+    # right 텍스트 기반 판정 (핵심)
+    if ("성취기준별" in right_norm and "성취수준" in right_norm):
+        return "standard"
+    if ("영역별" in right_norm and "성취수준" in right_norm):
+        return "achievement"
+    if ("예시" in right_norm and "평가" in right_norm and "도구" in right_norm):
+        # ✅ 예외: left_num이 "2" 여도 assessment로 처리
+        return "assessment"
+
+    # 보수적으로 left_num까지 고려하고 싶으면 아래처럼 보강 가능(선택)
+    # if left_num == "2" and ("평가" in right_norm and "도구" in right_norm):
+    #     return "assessment"
+
     return None
 
 # =========================
@@ -468,8 +547,13 @@ ASSESS_HEADER_ALIASES = {
 REQUIRED_ASSESS_CANON = {CAN_ITEM, CAN_UNIT, CAN_CODE, CAN_TYPE, CAN_ELEM}
 
 def parse_assessment_table(tbl: ET.Element, extra_aliases: Optional[Dict[str, str]] = None) -> Optional[List[Dict[str, Any]]]:
+    # ✅ 텍스트 매트릭스(헤더 판별용) + tc 매트릭스(평가요소 문단 분리용) 같이 만든다
     matrix = table_to_matrix(tbl)
+    tc_matrix = table_to_tc_matrix(tbl)
+
     if not matrix or len(matrix) < 2:
+        return None
+    if not tc_matrix or len(tc_matrix) < 2:
         return None
 
     aliases = dict(ASSESS_HEADER_ALIASES)
@@ -503,17 +587,36 @@ def parse_assessment_table(tbl: ET.Element, extra_aliases: Optional[Dict[str, st
     col_elem = idx(CAN_ELEM)
 
     items: List[Dict[str, Any]] = []
-    for r in matrix[header_row_idx + 1:]:
+
+    # ✅ 헤더 다음 행부터 데이터
+    for r_i in range(header_row_idx + 1, len(matrix)):
+        r = matrix[r_i]
+        # 안전: 행 길이/컬럼 인덱스 체크
         if len(r) <= max(col_item, col_unit, col_code, col_type, col_elem):
+            continue
+        if r_i >= len(tc_matrix):
+            continue
+        if len(tc_matrix[r_i]) <= col_elem:
             continue
 
         item_number = _clean_inline(r[col_item])
         domain_unit = _clean_inline(r[col_unit])
         curriculum_code = _clean_inline(r[col_code])
         assessment_type = _clean_inline(r[col_type])
-        eval_text = _normalize_text(r[col_elem])
 
-        if not any([item_number, domain_unit, curriculum_code, assessment_type, eval_text]):
+        # ✅ 평가요소는 tc에서 문단 단위로 추출
+        elem_tc = tc_matrix[r_i][col_elem]
+        para_list = extract_cell_paragraphs(elem_tc)  # ["...", "...", ...]
+
+        if para_list:
+            evaluation_elements = [strip_leading_bullet(p) for p in para_list if p.strip()]
+        else:
+            eval_text = _normalize_text(r[col_elem])
+            evaluation_elements = [strip_leading_bullet(x) for x in split_eval_elements(eval_text)]
+
+
+        # 빈 행 스킵
+        if not any([item_number, domain_unit, curriculum_code, assessment_type]) and not evaluation_elements:
             continue
 
         items.append({
@@ -521,7 +624,7 @@ def parse_assessment_table(tbl: ET.Element, extra_aliases: Optional[Dict[str, st
             "domain_unit": domain_unit,
             "curriculum_code": curriculum_code,
             "assessment_type": assessment_type,
-            "evaluation_elements": split_eval_elements(eval_text),
+            "evaluation_elements": evaluation_elements,
         })
 
     return items if items else None
@@ -530,16 +633,21 @@ def parse_assessment_table(tbl: ET.Element, extra_aliases: Optional[Dict[str, st
 # =========================
 # Main parse_2022
 # =========================
-def parse_2022(hwpx_bytes: bytes, extra_assess_aliases: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
+def parse_2022(
+    hwpx_bytes: bytes,
+    extra_assess_aliases: Optional[Dict[str, str]] = None
+) -> List[Dict[str, Any]]:
+
     results: List[Dict[str, Any]] = []
     sections = read_hwpx_sections_from_bytes(hwpx_bytes)
 
-    current_major: Optional[str] = None   # "1" | "2" | "3"
+    # 상태 변수
+    current_major: Optional[str] = None        # "1" | "2" | "3" (참고용)
+    current_section: Optional[str] = None      # "achievement" | "assessment" | None
     current_subject: str = "UNKNOWN"
     pending_subject: Optional[str] = None
 
-    last_subtitle: str = ""  # (숫자) 문장 (2 구간) 또는 고정문구(3 구간)
-
+    last_subtitle: str = ""
     recent_paras = deque(maxlen=30)
 
     for sec_idx, (_, xml_text) in enumerate(sections):
@@ -550,48 +658,58 @@ def parse_2022(hwpx_bytes: bytes, extra_assess_aliases: Optional[Dict[str, str]]
             para_no += 1
             tbl = p.find(".//" + HP_TBL)
 
-            # ---------- TABLE ----------
+            # =========================
+            # TABLE 처리
+            # =========================
             if tbl is not None:
-                # ✅ 어떤 major이든, 테이블을 만나기 직전에 pending_subject가 있으면 커밋
+                # subject 커밋
                 if pending_subject:
                     current_subject = pending_subject
                     pending_subject = None
-                # ✅ 핵심 패치: major 판정은 "진짜 1행2열 타이틀 표"만 사용
-                major = detect_major_by_title_table(tbl)
-                if major:
-                    current_major = major
+
+                # ✅ 1행 2열 타이틀 표 → 섹션 의미 판단
+                section = detect_section_by_title_table(tbl)
+                if section:
                     recent_paras.clear()
 
-                    if major == "1":
-                        if pending_subject:
-                            current_subject = pending_subject
-                            pending_subject = None
+                    if section == "standard":
+                        current_major = "1"
+                        current_section = None
                         last_subtitle = ""
 
-                    elif major == "2":
+                    elif section == "achievement":
+                        current_major = "2"
+                        current_section = "achievement"
                         last_subtitle = ""
 
-                    elif major == "3":
+                    elif section == "assessment":
+                        # ✅ 핵심: major 숫자와 무관하게 예시 평가 도구면 assessment
+                        current_major = "3"   # 참고용
+                        current_section = "assessment"
                         last_subtitle = "가. 예시 평가 도구 개요"
 
                     continue
 
-                # ✅ 2 영역별 성취수준: ach table 파싱
-                if current_major == "2":
-                    ach_obj = parse_achievement_table_2022(tbl, ctx=list(recent_paras))
+                # ---------- achievement ----------
+                if current_section == "achievement":
+                    ach_obj = parse_achievement_table_2022(
+                        tbl,
+                        ctx=list(recent_paras)
+                    )
                     if ach_obj is not None:
                         ach_obj["title"] = "2 영역별 성취수준"
-                        ach_obj["subtitle"] = last_subtitle  # "(n) 문장" 그대로
-
+                        ach_obj["subtitle"] = last_subtitle
                         ach_obj["_subject"] = current_subject
                         ach_obj["_order"] = (sec_idx, para_no)
-
                         results.append(ach_obj)
                         continue
 
-                # ✅ 3 예시 평가 도구: ass table 파싱
-                if current_major == "3":
-                    ass_items = parse_assessment_table(tbl, extra_aliases=extra_assess_aliases)
+                # ---------- assessment ----------
+                if current_section == "assessment":
+                    ass_items = parse_assessment_table(
+                        tbl,
+                        extra_aliases=extra_assess_aliases
+                    )
                     if ass_items is not None:
                         results.append({
                             "_subject": current_subject,
@@ -602,47 +720,64 @@ def parse_2022(hwpx_bytes: bytes, extra_assess_aliases: Optional[Dict[str, str]]
                         })
                         continue
 
-                continue
+                continue  # TABLE 끝
 
-            # ---------- PARAGRAPH ----------
+            # =========================
+            # PARAGRAPH 처리
+            # =========================
             texts = extract_all_hp_text(p)
             if not texts:
                 continue
+
             para_text = _clean_inline(" ".join(texts))
             if not para_text or _is_table_caption(para_text):
                 continue
 
+            # --- 과목 감지 ---
             subj = detect_subject_event(recent_paras, para_text)
             if subj:
                 pending_subject = subj
                 recent_paras.append(para_text)
                 continue
 
-
+            # --- 문단 기반 major 감지 (보조) ---
             m = RE_MAJOR.match(para_text)
             if m:
-                current_major = m.group(1)
+                num = m.group(1)
+                title = m.group(2).replace(" ", "")
+
+                current_major = num
                 recent_paras.clear()
-                if current_major == "2":
+
+                if "영역별" in title and "성취수준" in title:
+                    current_section = "achievement"
                     last_subtitle = ""
-                elif current_major == "3":
+                elif "예시" in title and "평가" in title:
+                    current_section = "assessment"
                     last_subtitle = "가. 예시 평가 도구 개요"
                 else:
+                    current_section = None
                     last_subtitle = ""
+
                 recent_paras.append(para_text)
                 continue
 
-            if current_major == "2" and RE_SUBTITLE.match(para_text):
+            # --- achievement 소제목 ---
+            if current_section == "achievement" and RE_SUBTITLE.match(para_text):
                 last_subtitle = para_text
                 recent_paras.append(para_text)
                 continue
 
             recent_paras.append(para_text)
 
+    # =========================
+    # 정리
+    # =========================
     results.sort(key=lambda x: x.get("_order", (10**9, 10**9)))
     for r in results:
         r.pop("_order", None)
         r.pop("_first_area", None)
+
     return results
 
 
